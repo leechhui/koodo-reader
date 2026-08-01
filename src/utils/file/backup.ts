@@ -16,6 +16,12 @@ import BackgroundUtil from "./backgroundUtil";
 import FontUtil from "./fontUtil";
 import toast from "react-hot-toast";
 import i18n from "../../i18n";
+import {
+  addEncryptedMarkerToFileName,
+  encryptBookPayload,
+  isEncryptedMarkedFileName,
+  getEncryptedBookFileName,
+} from "./bookCrypto";
 
 declare var window: any;
 
@@ -26,9 +32,8 @@ export const backup = async (service: string): Promise<Boolean> => {
     let year = new Date().getFullYear(),
       month = new Date().getMonth() + 1,
       day = new Date().getDate();
-    fileName = `${year}-${month <= 9 ? "0" + month : month}-${
-      day <= 9 ? "0" + day : day
-    }.zip`;
+    fileName = `${year}-${month <= 9 ? "0" + month : month}-${day <= 9 ? "0" + day : day
+      }.zip`;
   }
   if (isElectron) {
     const { ipcRenderer } = window.require("electron");
@@ -199,6 +204,13 @@ export const backupFromPath = async (
 
   const zip = new JSZipNode();
 
+  const toArrayBuffer = (buffer: Buffer): ArrayBuffer => {
+    return buffer.buffer.slice(
+      buffer.byteOffset,
+      buffer.byteOffset + buffer.byteLength
+    );
+  };
+
   // Recursively add a directory from disk into the zip
   const addDirectoryToZip = (
     zipFolder: any,
@@ -224,13 +236,39 @@ export const backupFromPath = async (
     }
   };
 
+  const addBookDirectoryToZip = async () => {
+    const sourceDir = path.join(dataPath, "book");
+    if (!fs.existsSync(sourceDir)) {
+      return;
+    }
+    const entries: any[] = fs.readdirSync(sourceDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile()) {
+        continue;
+      }
+      const sourcePath = path.join(sourceDir, entry.name);
+      const rawBuffer = fs.readFileSync(sourcePath);
+      const encryptedFileName = isEncryptedMarkedFileName(entry.name)
+        ? entry.name
+        : addEncryptedMarkerToFileName(entry.name);
+      const encryptedBuffer = isEncryptedMarkedFileName(entry.name)
+        ? rawBuffer
+        : Buffer.from(await encryptBookPayload(toArrayBuffer(rawBuffer)));
+      zip.file(path.posix.join("book", encryptedFileName), encryptedBuffer, {
+        binary: true,
+        createFolders: true,
+      });
+    }
+  };
+
   // Add book, cover, dict, background, snapshot directories
-  for (const dir of ["book", "cover", "dict", "background", "snapshot"]) {
+  for (const dir of ["cover", "dict", "background", "snapshot"]) {
     const sourceDir = path.join(dataPath, dir);
     if (fs.existsSync(sourceDir)) {
       addDirectoryToZip(zip, sourceDir, dir);
     }
   }
+  await addBookDirectoryToZip();
 
   // Add config JSON files
   for (const configFile of ["config.json", "sync.json"]) {
@@ -282,7 +320,7 @@ export const backupFromPath = async (
     if (fs.existsSync(tempPath)) {
       try {
         fs.unlinkSync(tempPath);
-      } catch (_) {}
+      } catch (_) { }
     }
     const errorMessage = error instanceof Error ? error.message : String(error);
     toast.error(errorMessage, { id: "backup" });
@@ -351,14 +389,14 @@ export const zipBook = (zip: any) => {
   return new Promise<boolean>(async (resolve) => {
     let books = await DatabaseService.getAllRecords("books");
     let bookZip = zip.folder("book");
-    let data: any = [];
+    let data: Promise<boolean | ArrayBuffer | File>[] = [];
     books &&
       books.forEach((item) => {
         data.push(
           BookUtil.fetchBook(
             item.key,
             item.format.toLowerCase(),
-            false,
+            true,
             item.path
           )
         );
@@ -366,11 +404,17 @@ export const zipBook = (zip: any) => {
     try {
       let results = await Promise.all(data);
       for (let i = 0; i < books.length; i++) {
-        results[i] &&
-          bookZip.file(
-            `${books[i].key}.${books[i].format.toLocaleLowerCase()}`,
-            results[i]
-          );
+        if (!results[i]) {
+          continue;
+        }
+        const encrypted = await encryptBookPayload(results[i] as ArrayBuffer);
+        bookZip.file(
+          getEncryptedBookFileName(
+            books[i].key,
+            books[i].format.toLocaleLowerCase()
+          ),
+          encrypted
+        );
       }
       resolve(true);
     } catch (error) {

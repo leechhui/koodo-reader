@@ -16,7 +16,25 @@ import i18n from "../../i18n";
 import { getCloudConfig } from "./common";
 import CoverUtil from "./coverUtil";
 import { LocalFileManager } from "./localFile";
+import {
+  decryptBookPayload,
+  encryptBookPayload,
+  getEncryptedBookFileName,
+  getPlainBookFileName,
+  isEncryptedMarkedFileName,
+  removeEncryptedMarkerFromFileName,
+} from "./bookCrypto";
 declare var window: any;
+
+const bufferToArrayBuffer = (buffer: Buffer): ArrayBuffer => {
+  return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+};
+
+const getFileNameFromPath = (bookPath: string): string => {
+  if (!bookPath) return "";
+  const normalized = bookPath.replace(/\\/g, "/");
+  return normalized.split("/").pop() || "";
+};
 
 class BookUtil {
   static async addBook(key: string, format: string, buffer: ArrayBuffer) {
@@ -62,14 +80,23 @@ class BookUtil {
         const dataPath = getStorageLocation() || "";
         return new Promise<void>((resolve, reject) => {
           try {
-            fs_extra.remove(
-              path.join(dataPath, `book`, key + "." + format),
-              (err) => {
-                if (err) throw err;
+            const plainFilePath = path.join(
+              dataPath,
+              `book`,
+              getPlainBookFileName(key, format)
+            );
+            const encryptedFilePath = path.join(
+              dataPath,
+              `book`,
+              getEncryptedBookFileName(key, format)
+            );
+
+            fs_extra.remove(plainFilePath, () => {
+              fs_extra.remove(encryptedFilePath, () => {
                 this.deleteCloudBook(key, format);
                 resolve();
-              }
-            );
+              });
+            });
           } catch (e) {
             reject();
           }
@@ -91,17 +118,23 @@ class BookUtil {
       if (isElectron) {
         var fs = window.require("fs");
         var path = window.require("path");
-        let _bookPath = path.join(
+        let plainBookPath = path.join(
           getStorageLocation() || "",
           `book`,
-          key + "." + format
+          getPlainBookFileName(key, format)
+        );
+        let encryptedBookPath = path.join(
+          getStorageLocation() || "",
+          `book`,
+          getEncryptedBookFileName(key, format)
         );
 
         if (key.startsWith("cache")) {
-          resolve(fs.existsSync(_bookPath));
+          resolve(fs.existsSync(plainBookPath) || fs.existsSync(encryptedBookPath));
         } else if (
           (bookPath && fs.existsSync(bookPath)) ||
-          fs.existsSync(_bookPath)
+          fs.existsSync(plainBookPath) ||
+          fs.existsSync(encryptedBookPath)
         ) {
           resolve(true);
         } else {
@@ -136,30 +169,71 @@ class BookUtil {
       return new Promise<File | ArrayBuffer | boolean>((resolve) => {
         var fs = window.require("fs");
         var path = window.require("path");
-        let _bookPath = path.join(
+        const plainBookPath = path.join(
           getStorageLocation() || "",
           `book`,
-          key + "." + format
+          getPlainBookFileName(key, format)
         );
-        var data;
-        if (fs.existsSync(_bookPath)) {
-          data = fs.readFileSync(_bookPath);
-        } else if (bookPath && fs.existsSync(bookPath)) {
-          data = fs.readFileSync(bookPath);
-        } else {
-          resolve(false);
-        }
+        const encryptedBookPath = path.join(
+          getStorageLocation() || "",
+          `book`,
+          getEncryptedBookFileName(key, format)
+        );
 
-        let blobTemp = new Blob([data]);
-        let fileTemp = new File([blobTemp], "data", {
-          lastModified: new Date().getTime(),
-          type: blobTemp.type,
-        });
-        if (isArrayBuffer) {
-          resolve(new Uint8Array(data).buffer);
-        } else {
-          resolve(fileTemp);
-        }
+        (async () => {
+          let data: Buffer | null = null;
+          let isEncryptedFile = false;
+
+          if (fs.existsSync(plainBookPath)) {
+            data = fs.readFileSync(plainBookPath);
+          } else if (fs.existsSync(encryptedBookPath)) {
+            data = fs.readFileSync(encryptedBookPath);
+            isEncryptedFile = true;
+          } else if (bookPath && fs.existsSync(bookPath)) {
+            data = fs.readFileSync(bookPath);
+            isEncryptedFile = isEncryptedMarkedFileName(getFileNameFromPath(bookPath));
+          } else {
+            resolve(false);
+            return;
+          }
+
+          if (!data) {
+            resolve(false);
+            return;
+          }
+
+          let contentBuffer = bufferToArrayBuffer(data);
+
+          if (isEncryptedFile) {
+            const decryptedResult = await decryptBookPayload(contentBuffer);
+            if (!decryptedResult.success) {
+              resolve(false);
+              return;
+            }
+            contentBuffer = decryptedResult.data;
+          } else {
+            const maybeEncrypted = await decryptBookPayload(contentBuffer);
+            if (maybeEncrypted.encrypted) {
+              if (!maybeEncrypted.success) {
+                resolve(false);
+                return;
+              }
+              contentBuffer = maybeEncrypted.data;
+            }
+          }
+
+          let blobTemp = new Blob([contentBuffer]);
+          let fileTemp = new File([blobTemp], "data", {
+            lastModified: new Date().getTime(),
+            type: blobTemp.type,
+          });
+
+          if (isArrayBuffer) {
+            resolve(contentBuffer);
+          } else {
+            resolve(fileTemp);
+          }
+        })();
       });
     } else {
       if (ConfigService.getItem("isUseLocal") === "yes") {
@@ -176,13 +250,20 @@ class BookUtil {
     if (isElectron) {
       var fs = window.require("fs");
       var path = window.require("path");
-      let _bookPath = path.join(
+      let plainBookPath = path.join(
         getStorageLocation() || "",
         `book`,
-        book.key + "." + book.format
+        getPlainBookFileName(book.key, book.format)
       );
-      if (fs.existsSync(_bookPath)) {
-        return _bookPath;
+      let encryptedBookPath = path.join(
+        getStorageLocation() || "",
+        `book`,
+        getEncryptedBookFileName(book.key, book.format)
+      );
+      if (fs.existsSync(plainBookPath)) {
+        return plainBookPath;
+      } else if (fs.existsSync(encryptedBookPath)) {
+        return encryptedBookPath;
       } else if (book.path && fs.existsSync(book.path)) {
         return book.path;
       } else {
@@ -222,7 +303,7 @@ class BookUtil {
       });
       if (
         (await TokenService.getToken("is_authed")) === "yes" &&
-        (await this.isBookExistInCloud(book.key))
+        (await this.isBookExistInCloud(book.key, book.format))
       ) {
         let timer = showDownloadProgress(
           ConfigService.getItem("defaultSyncOption") || "",
@@ -279,16 +360,14 @@ class BookUtil {
     if (isElectron) {
       if (ConfigService.getReaderConfig("isOpenInMain") === "yes") {
         window.require("electron").ipcRenderer.invoke("new-tab", {
-          url: `${window.location.href.split("#")[0]}#/${ref}/${
-            book.key
-          }?title=${book.name}&file=${book.key}`,
+          url: `${window.location.href.split("#")[0]}#/${ref}/${book.key
+            }?title=${book.name}&file=${book.key}`,
         });
       } else {
         const { ipcRenderer } = window.require("electron");
         ipcRenderer.invoke("open-book", {
-          url: `${window.location.href.split("#")[0]}#/${ref}/${
-            book.key
-          }?title=${book.name}&file=${book.key}`,
+          url: `${window.location.href.split("#")[0]}#/${ref}/${book.key
+            }?title=${book.name}&file=${book.key}`,
           isMergeWord: ConfigService.getReaderConfig("isMergeWord"),
           isAutoFullscreen: ConfigService.getReaderConfig("isAutoFullscreen"),
           isAutoMaximize: ConfigService.getReaderConfig("isAutoMaximize"),
@@ -298,8 +377,7 @@ class BookUtil {
       }
     } else {
       window.open(
-        `${window.location.href.split("#")[0]}#/${ref}/${book.key}?title=${
-          book.name
+        `${window.location.href.split("#")[0]}#/${ref}/${book.key}?title=${book.name
         }&file=${book.key}`
       );
     }
@@ -323,7 +401,7 @@ class BookUtil {
       window.location.reload();
     }
   }
-  static async isBookExistInCloud(key: string) {
+  static async isBookExistInCloud(key: string, format: string) {
     let service = ConfigService.getItem("defaultSyncOption");
     if (!service) {
       return false;
@@ -333,16 +411,35 @@ class BookUtil {
 
       let tokenConfig = await getCloudConfig(service);
 
+      const encryptedExist = await ipcRenderer.invoke("cloud-exist", {
+        ...tokenConfig,
+        fileName: getEncryptedBookFileName(key, format),
+        service: service,
+        type: "book",
+        storagePath: getStorageLocation(),
+      });
+
+      if (encryptedExist) {
+        return true;
+      }
+
       return await ipcRenderer.invoke("cloud-exist", {
         ...tokenConfig,
-        fileName: key,
+        fileName: getPlainBookFileName(key, format),
         service: service,
         type: "book",
         storagePath: getStorageLocation(),
       });
     } else {
       let syncUtil = await SyncService.getSyncUtil();
-      return await syncUtil.isExist(key, "book");
+      const encryptedExist = await syncUtil.isExist(
+        getEncryptedBookFileName(key, format),
+        "book"
+      );
+      if (encryptedExist) {
+        return true;
+      }
+      return await syncUtil.isExist(getPlainBookFileName(key, format), "book");
     }
   }
   static async downloadCacheBook(key: string) {
@@ -357,7 +454,42 @@ class BookUtil {
 
       let result = await ipcRenderer.invoke("cloud-download", {
         ...tokenConfig,
-        fileName: "cache-" + key + ".zip",
+        fileName: getEncryptedBookFileName("cache-" + key, "zip"),
+        service: service,
+        type: "book",
+        storagePath: getStorageLocation(),
+      });
+
+      if (result) {
+        const fs = window.require("fs");
+        const path = window.require("path");
+        const dataPath = getStorageLocation() || "";
+        const encryptedPath = path.join(
+          dataPath,
+          "book",
+          getEncryptedBookFileName("cache-" + key, "zip")
+        );
+        const plainPath = path.join(
+          dataPath,
+          "book",
+          getPlainBookFileName("cache-" + key, "zip")
+        );
+
+        if (fs.existsSync(encryptedPath)) {
+          const encryptedBuffer = bufferToArrayBuffer(fs.readFileSync(encryptedPath));
+          const decrypted = await decryptBookPayload(encryptedBuffer);
+          if (!decrypted.success) {
+            return false;
+          }
+          fs.writeFileSync(plainPath, Buffer.from(decrypted.data));
+          fs.unlinkSync(encryptedPath);
+          return true;
+        }
+      }
+
+      result = await ipcRenderer.invoke("cloud-download", {
+        ...tokenConfig,
+        fileName: getPlainBookFileName("cache-" + key, "zip"),
         service: service,
         type: "book",
         storagePath: getStorageLocation(),
@@ -369,7 +501,26 @@ class BookUtil {
       return true;
     } else {
       let syncUtil = await SyncService.getSyncUtil();
-      let cache = await syncUtil.downloadFile("cache-" + key + ".zip", "book");
+
+      let encryptedCache = await syncUtil.downloadFile(
+        getEncryptedBookFileName("cache-" + key, "zip"),
+        "book"
+      );
+
+      if (encryptedCache) {
+        const decrypted = await decryptBookPayload(encryptedCache);
+        if (!decrypted.success) {
+          return false;
+        }
+        await this.addBook("cache-" + key, "zip", decrypted.data);
+        toast.dismiss("add-book");
+        return true;
+      }
+
+      let cache = await syncUtil.downloadFile(
+        getPlainBookFileName("cache-" + key, "zip"),
+        "book"
+      );
       if (!cache) {
         console.error("download cache failed");
         return false;
@@ -389,9 +540,37 @@ class BookUtil {
 
       let tokenConfig = await getCloudConfig(service);
 
+      const encryptedFileName = getEncryptedBookFileName(key, format);
+      const plainFileName = getPlainBookFileName(key, format);
       let result = await ipcRenderer.invoke("cloud-download", {
         ...tokenConfig,
-        fileName: key + "." + format.toLowerCase(),
+        fileName: encryptedFileName,
+        service: service,
+        type: "book",
+        storagePath: getStorageLocation(),
+      });
+
+      if (result) {
+        const fs = window.require("fs");
+        const path = window.require("path");
+        const dataPath = getStorageLocation() || "";
+        const encryptedPath = path.join(dataPath, "book", encryptedFileName);
+        const plainPath = path.join(dataPath, "book", plainFileName);
+        if (fs.existsSync(encryptedPath)) {
+          const encryptedBuffer = bufferToArrayBuffer(fs.readFileSync(encryptedPath));
+          const decrypted = await decryptBookPayload(encryptedBuffer);
+          if (!decrypted.success) {
+            return false;
+          }
+          fs.writeFileSync(plainPath, Buffer.from(decrypted.data));
+          fs.unlinkSync(encryptedPath);
+          return true;
+        }
+      }
+
+      result = await ipcRenderer.invoke("cloud-download", {
+        ...tokenConfig,
+        fileName: plainFileName,
         service: service,
         type: "book",
         storagePath: getStorageLocation(),
@@ -399,15 +578,35 @@ class BookUtil {
       return result;
     } else {
       let syncUtil = await SyncService.getSyncUtil();
-      let bookBuffer = await syncUtil.downloadFile(
-        key + "." + format.toLowerCase(),
+
+      const encryptedFileName = getEncryptedBookFileName(key, format);
+      const plainFileName = getPlainBookFileName(key, format);
+      let encryptedBuffer = await syncUtil.downloadFile(
+        encryptedFileName,
         "book"
       );
+
+      if (encryptedBuffer) {
+        const decrypted = await decryptBookPayload(encryptedBuffer);
+        if (!decrypted.success) {
+          return false;
+        }
+        if (ConfigService.getItem("isUseLocal") === "yes") {
+          await LocalFileManager.saveFile(plainFileName, decrypted.data, "book");
+        } else {
+          await localforage.setItem(key, decrypted.data);
+        }
+        toast.dismiss("add-book");
+        return true;
+      }
+
+      let bookBuffer = await syncUtil.downloadFile(plainFileName, "book");
       if (!bookBuffer) {
         return false;
       }
+
       if (ConfigService.getItem("isUseLocal") === "yes") {
-        await LocalFileManager.saveFile(key + "." + format, bookBuffer, "book");
+        await LocalFileManager.saveFile(plainFileName, bookBuffer, "book");
       } else {
         await localforage.setItem(key, bookBuffer);
       }
@@ -430,30 +629,56 @@ class BookUtil {
     if (isElectron) {
       const { ipcRenderer } = window.require("electron");
 
-      let tokenConfig = await getCloudConfig(service);
-      let result = await ipcRenderer.invoke("cloud-upload", {
-        ...tokenConfig,
-        fileName: key + "." + format.toLowerCase(),
-        service: service,
-        type: "book",
-        storagePath: getStorageLocation(),
-      });
-      if (!result) {
-        toast.error(i18n.t("Upload failed"), {
-          id: "upload-book",
-        });
+      const fs = window.require("fs");
+      const path = window.require("path");
+      const dataPath = getStorageLocation() || "";
+      const plainFileName = getPlainBookFileName(key, format);
+      const encryptedFileName = getEncryptedBookFileName(key, format);
+      const plainPath = path.join(dataPath, "book", plainFileName);
+      const encryptedPath = path.join(dataPath, "book", encryptedFileName);
+
+      if (!fs.existsSync(plainPath)) {
         return;
+      }
+
+      const rawBuffer = bufferToArrayBuffer(fs.readFileSync(plainPath));
+      const encryptedBuffer = await encryptBookPayload(rawBuffer);
+      fs.writeFileSync(encryptedPath, Buffer.from(encryptedBuffer));
+
+      let tokenConfig = await getCloudConfig(service);
+      try {
+        let result = await ipcRenderer.invoke("cloud-upload", {
+          ...tokenConfig,
+          fileName: encryptedFileName,
+          service: service,
+          type: "book",
+          storagePath: getStorageLocation(),
+        });
+        if (!result) {
+          toast.error(i18n.t("Upload failed"), {
+            id: "upload-book",
+          });
+          return;
+        }
+      } finally {
+        if (fs.existsSync(encryptedPath)) {
+          fs.unlinkSync(encryptedPath);
+        }
       }
     } else {
       let syncUtil = await SyncService.getSyncUtil();
       let bookBuffer: any = await this.fetchBook(key, format, true, "");
+      if (!bookBuffer) {
+        return;
+      }
+      const encryptedBuffer = await encryptBookPayload(bookBuffer as ArrayBuffer);
       let bookBlob = new Blob([bookBuffer], {
         type: CommonTool.getMimeType(format.toLowerCase()),
       });
       let result = await syncUtil.uploadFile(
-        key + "." + format.toLowerCase(),
+        getEncryptedBookFileName(key, format),
         "book",
-        bookBlob
+        new Blob([encryptedBuffer], { type: bookBlob.type })
       );
       if (!result) {
         toast.error(i18n.t("Upload failed"), {
@@ -479,14 +704,23 @@ class BookUtil {
 
       await ipcRenderer.invoke("cloud-delete", {
         ...tokenConfig,
-        fileName: key + "." + format.toLowerCase(),
+        fileName: getEncryptedBookFileName(key, format),
+        service: service,
+        type: "book",
+        storagePath: getStorageLocation(),
+      });
+
+      await ipcRenderer.invoke("cloud-delete", {
+        ...tokenConfig,
+        fileName: getPlainBookFileName(key, format),
         service: service,
         type: "book",
         storagePath: getStorageLocation(),
       });
     } else {
       let syncUtil = await SyncService.getSyncUtil();
-      await syncUtil.deleteFile(key + "." + format.toLowerCase(), "book");
+      await syncUtil.deleteFile(getEncryptedBookFileName(key, format), "book");
+      await syncUtil.deleteFile(getPlainBookFileName(key, format), "book");
     }
   }
 
@@ -536,16 +770,29 @@ class BookUtil {
 
       let tokenConfig = await getCloudConfig(service);
 
-      return await ipcRenderer.invoke("cloud-list", {
+      const cloudList = await ipcRenderer.invoke("cloud-list", {
         ...tokenConfig,
         service: service,
         type: "book",
         storagePath: getStorageLocation(),
       });
+      return Array.from(
+        new Set(
+          (cloudList || []).map((fileName: string) =>
+            removeEncryptedMarkerFromFileName(fileName)
+          )
+        )
+      );
     } else {
       let syncUtil = await SyncService.getSyncUtil();
       let cloudBookList = await syncUtil.listFiles("book");
-      return cloudBookList;
+      return Array.from(
+        new Set(
+          (cloudBookList || []).map((fileName: string) =>
+            removeEncryptedMarkerFromFileName(fileName)
+          )
+        )
+      );
     }
   }
   static async getBookNamesMapByKeys(bookKeys: string[]) {

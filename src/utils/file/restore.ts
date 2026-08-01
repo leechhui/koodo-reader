@@ -13,7 +13,20 @@ import { isElectron } from "react-device-detect";
 import JSZip from "jszip";
 import { LocalFileManager } from "./localFile";
 import CoverUtil from "./coverUtil";
+import {
+  decryptBookPayload,
+  isEncryptedMarkedFileName,
+  removeEncryptedMarkerFromFileName,
+} from "./bookCrypto";
 declare var window: any;
+
+const getLocalForageKeyFromFileName = (fileName: string): string => {
+  const dotIndex = fileName.lastIndexOf(".");
+  if (dotIndex <= 0) {
+    return fileName;
+  }
+  return fileName.substring(0, dotIndex);
+};
 
 const mergeRecords = (localRecords: any[], backupRecords: any[]): any[] => {
   const recordMap = new Map(localRecords.map((r) => [r.key, r]));
@@ -127,14 +140,31 @@ export const restoreFromBrowser = async (): Promise<Boolean> => {
           bookFiles.map(async (fileName) => {
             try {
               const entryName = fileName.split("/").pop() || "";
-              const buf: ArrayBuffer = await zip
+              const rawBuf: ArrayBuffer = await zip
                 .file(fileName)!
                 .async("arraybuffer");
+              let targetFileName = entryName;
+              let targetBuffer = rawBuf;
+
+              if (isEncryptedMarkedFileName(entryName)) {
+                const decrypted = await decryptBookPayload(rawBuf);
+                if (!decrypted.success) {
+                  failed = true;
+                  return;
+                }
+                targetBuffer = decrypted.data;
+                targetFileName = removeEncryptedMarkerFromFileName(entryName);
+              }
+
               if (isUseLocal) {
-                await LocalFileManager.saveFile(entryName, buf, "book");
+                await LocalFileManager.saveFile(
+                  targetFileName,
+                  targetBuffer,
+                  "book"
+                );
               } else {
-                const key = entryName.substring(0, entryName.lastIndexOf("."));
-                await localforage.setItem(key, buf);
+                const key = getLocalForageKeyFromFileName(targetFileName);
+                await localforage.setItem(key, targetBuffer);
               }
               updateProgress();
             } catch {
@@ -381,8 +411,48 @@ export const restoreFromfilePath = async (filePath: string) => {
         name.startsWith("font/") ||
         name.startsWith("snapshot/"))
   );
+
+  const bookAssetFiles = assetFiles.filter((name) => name.startsWith("book/"));
+  const nonBookAssetFiles = assetFiles.filter(
+    (name) => !name.startsWith("book/")
+  );
+
+  for (const fileName of bookAssetFiles) {
+    try {
+      const entryName = path.basename(fileName);
+      const rawBuf: ArrayBuffer = await zip.file(fileName)!.async("arraybuffer");
+      let outputFileName = entryName;
+      let outputBuffer = rawBuf;
+
+      if (isEncryptedMarkedFileName(entryName)) {
+        const decrypted = await decryptBookPayload(rawBuf);
+        if (!decrypted.success) {
+          failed = true;
+          break;
+        }
+        outputBuffer = decrypted.data;
+        outputFileName = removeEncryptedMarkerFromFileName(entryName);
+      }
+
+      const outputPath = path.join(dataPath, "book", outputFileName);
+      const outputDir = path.dirname(outputPath);
+      if (!fs.existsSync(outputDir)) {
+        fs.mkdirSync(outputDir, { recursive: true });
+      }
+      fs.writeFileSync(outputPath, Buffer.from(outputBuffer));
+      updateProgress();
+    } catch {
+      failed = true;
+      break;
+    }
+  }
+
+  if (failed) {
+    return false;
+  }
+
   await Promise.all(
-    assetFiles.map(async (fileName) => {
+    nonBookAssetFiles.map(async (fileName) => {
       try {
         const dest = path.join(dataPath, fileName);
         const stream = zip.file(fileName)!.nodeStream();
